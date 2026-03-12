@@ -38,6 +38,7 @@ config = {
     'max_model_length': 128,
     'gpu_memory_utilization': 0.9,
     'eos': 151645,  # Fixed: should match tokenizer.eos_token_id
+    'kv_cache_dtype': 'int8',
 }
 
 def main():
