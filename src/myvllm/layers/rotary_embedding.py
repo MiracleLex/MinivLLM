@@ -103,6 +103,8 @@ class RotaryEmbedding(nn.Module):
     def forward(self, positions, query, key):
         cos_sin = self.cos_sin_cache[positions]  # (seq_len, rotary_embedding)
         cos, sin = cos_sin.chunk(2, dim=-1)
+        cos = cos.to(query.dtype)
+        sin = sin.to(query.dtype)
         return (
             apply_rotary_pos_emb(query, cos, sin),
             apply_rotary_pos_emb(key, cos, sin)
