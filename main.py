@@ -4,6 +4,7 @@ import torch.distributed as dist
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
+torch.set_default_dtype(torch.bfloat16)
 
 # Add src to Python path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
