@@ -92,6 +92,7 @@ class BlockManager:
                 # cache miss
                 block = self._allocate_block(self.free_block_ids[0])
                 block.update(h=h, token_ids=token_ids)
+                block.ref_count = 1
                 if h != -1:
                     self.hash_to_block_id[h] = block.block_id
             seq.block_table.append(block.block_id)
