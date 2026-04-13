@@ -69,8 +69,7 @@ class Sequence:
 
     @property
     def last_block_num_tokens(self):
-        full_blocks = int(math.floor(self.num_tokens / self.block_size))
-        return len(self.token_ids[full_blocks * self.block_size : ])
+        return self.num_tokens - max(self.num_blocks - 1, 0) * self.block_size
 
     def block(self, i):
         assert 0 <= i < self.num_blocks, f"Block index {i} out of range [0, {self.num_blocks})"
