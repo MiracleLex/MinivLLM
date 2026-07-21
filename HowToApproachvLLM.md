@@ -147,6 +147,20 @@ for name, param in model.named_parameters():
    - Each GPU stores complete heads (don't shard head_size)
    - Enables independent attention computation per GPU
 
+**Benchmark Results:**
+Use the following command to enter the `src/myvllm/layers` directory, and verify whether the execution results are correct in a distributed environment.
+```
+cd src/myvllm/layers
+CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --nproc_per_node=4 linear.py
+```
+If the output shows `allclose=True`, it indicates that the multi-machine parallel results are consistent with the single-machine results.
+```
+[ColumnParallel] allclose=True, max_abs_err=0.000107
+[MergedColumnParallel] allclose=True, max_abs_err=0.000103
+[QKVColumnParallel] allclose=True, max_abs_err=0.000061
+[RowParallel] allclose=True, max_abs_err=0.000011
+```
+
 **MLP Layer Pattern:**
 - One ColumnParallel → One RowParallel → `dist.all_reduce`
 - Output sharding of first layer = Input sharding of second layer
@@ -734,7 +748,17 @@ Path: [llm_engine.py](src/myvllm/engine/llm_engine.py)
 
 ---
 
-### 6.2 Cleanup
+### 6.2 Initialization Order
+
+**Why does the Scheduler init after the ModelRunner?**
+
+When `world_size > 1`, `ModelRunner.__init__` calls `dist.init_process_group('nccl', ...)`, which is a **collective barrier** — rank-0 blocks until every worker process has also called it. Only once all ranks have joined the process group does `ModelRunner.__init__` return. The Scheduler is created after that, ensuring the distributed environment is fully established before the engine is considered ready.
+
+When `world_size == 1` no worker processes are spawned and there is no barrier, so the ordering has no practical effect in that case.
+
+---
+
+### 6.3 Cleanup
 
 **Why `exit()` and `atexit.register(self.exit)`?**
 ```python
