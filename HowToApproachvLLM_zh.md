@@ -148,9 +148,24 @@ for name, param in model.named_parameters():
     - 每张 GPU 存完整的 heads（不对 `head_size` 维度做切分）
     - 使每张 GPU 可以独立完成注意力计算
 
+**基准测试：**
+使用如下指令，进入`src/myvllm/layers`目录，在分布式环境测试运行结果是否正确
+```
+cd src/myvllm/layers
+CUDA_VISIBLE_DEVICES=0,1,2,3 uv run torchrun --nproc_per_node=4 linear.py
+```
+输出结果`allclose=True`则代表多机并行结果与单机一致
+```
+[ColumnParallel] allclose=True, max_abs_err=0.000107
+[MergedColumnParallel] allclose=True, max_abs_err=0.000103
+[QKVColumnParallel] allclose=True, max_abs_err=0.000061
+[RowParallel] allclose=True, max_abs_err=0.000011
+```
 **MLP 层的常见模式:**
     - 一个 `ColumnParallel` → 一个 RowParallel → `dist.all_reduce`
     - 第一层的输出切分方式 = 第二层的输入切分方式
+
+
 
 ---
 
