@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/minivllm.png" alt="图片描述" width="50%" height="50%">
+  <img src="./assets/minivllm.png" alt="MinivLLM" width="50%" height="50%">
 </p>
 
 <p align="center">
