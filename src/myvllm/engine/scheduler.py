@@ -46,12 +46,14 @@ class Scheduler:
             # use can_append to check whether we can append one more token
             if not self.block_manager.can_append(seq):
                 if self.running:
+                    self.running.appendleft(seq)
                     self.preempt(self.running.pop())
                 else:
                     self.preempt(seq)
                     break
             else:
                 if current_scheduled_tokens >= self.max_num_batched_tokens or len(scheduled_sequences) >= self.max_num_sequences:
+                    self.running.appendleft(seq)
                     break
                 # append one token
                 self.block_manager.append(seq)
@@ -81,7 +83,7 @@ class Scheduler:
             # Reached max_tokens limit (number of completion tokens)
             # Reached max_model_length limit (total sequence length including prompt)
             stop_due_to_eos = not seq.ignore_eos and token_id == self.eos
-            stop_due_to_max_tokens = 1 + seq.num_completion_tokens >= seq.max_tokens
+            stop_due_to_max_tokens = seq.num_completion_tokens >= seq.max_tokens
             stop_due_to_max_length = seq.max_model_length is not None and seq.num_tokens >= seq.max_model_length
 
             if stop_due_to_eos or stop_due_to_max_tokens or stop_due_to_max_length:

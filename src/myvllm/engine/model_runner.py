@@ -2,10 +2,12 @@ import math
 import torch
 import pickle
 import torch.distributed as dist
+from pathlib import Path
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from myvllm.models.qwen3 import Qwen3ForCausalLM
+from myvllm.models.llama import LlamaForCausalLM
 from myvllm.layers.sampler import SamplerLayer
 from myvllm.engine.sequence import Sequence
 from myvllm.utils import *
@@ -25,31 +27,57 @@ class ModelRunner:
         torch.cuda.set_device(rank)
 
         # set model
-        self.model = Qwen3ForCausalLM(
-            vocab_size=config['vocab_size'],
-            hidden_size=config['hidden_size'],
-            num_heads=config['num_heads'],
-            head_dim=config['head_dim'],
-            scale=config['scale'],
-            num_kv_heads=config['num_kv_heads'],
-            rms_norm_epsilon=config['rms_norm_epsilon'],
-            qkv_bias=config['qkv_bias'],
-            base=config['base'],
-            max_position=config['max_position'],
-            intermediate_size=config['intermediate_size'],
-            ffn_bias=config['ffn_bias'],
-            num_layers=config['num_layers'],
-            tie_word_embeddings=config['tie_word_embeddings'],
-            block_size=self.block_size,
-        )
+        path_str = self.config['model_name_or_path']
+        model_name = Path(path_str).name
+        match model_name:
+            case 'Qwen3-0.6B':
+                self.model = Qwen3ForCausalLM(
+                    vocab_size=config['vocab_size'],
+                    hidden_size=config['hidden_size'],
+                    num_heads=config['num_heads'],
+                    head_dim=config['head_dim'],
+                    scale=config['scale'],
+                    num_kv_heads=config['num_kv_heads'],
+                    rms_norm_epsilon=config['rms_norm_epsilon'],
+                    qkv_bias=config['qkv_bias'],
+                    base=config['base'],
+                    max_position=config['max_position'],
+                    intermediate_size=config['intermediate_size'],
+                    ffn_bias=config['ffn_bias'],
+                    num_layers=config['num_layers'],
+                    tie_word_embeddings=config['tie_word_embeddings'],
+                    block_size=self.block_size,
+                )
+            case 'Llama-3.2-1B-Instruct':
+                self.model = LlamaForCausalLM(
+                    vocab_size=config['vocab_size'],
+                    hidden_size=config['hidden_size'],
+                    head_dim=config['head_dim'],
+                    num_qo_heads=config['num_qo_heads'],
+                    num_kv_heads=config['num_kv_heads'],
+                    has_attn_bias=config['has_attn_bias'],
+                    rms_norm_epsilon=config['rms_norm_epsilon'],
+                    rope_base=config['rope_base'],
+                    max_position_embeddings=config['max_position_embeddings'],
+                    intermediate_size=config['intermediate_size'],
+                    ffn_bias=config['ffn_bias'],
+                    num_layers=config['num_layers'],
+                    block_size=self.block_size,
+                    tie_word_embeddings=config['tie_word_embeddings'],
+                )
+            case _:
+                raise Exception(f"Unsupported model: {config['model_name_or_path']}")
 
-        # IMPORTANT: Move to CUDA before loading weights to avoid incorrect behavior
+        # Load weights in GPU (model moved to GPU before loading weights)
         self.model = self.model.cuda(rank)
 
         # Load pretrained weights if model_name_or_path is provided
         if config.get('model_name_or_path'):
             from myvllm.utils.loader import load_weights_from_checkpoint
             load_weights_from_checkpoint(self.model, config['model_name_or_path'])
+
+        # Load weights in CPU (move the model to GPU after loading weights)
+        # self.model = self.model.cuda(rank)
 
         self.sampler = SamplerLayer()
 
@@ -161,7 +189,7 @@ class ModelRunner:
         max_tokens = self.config['max_num_batch_tokens']
         max_model_length = self.config['max_model_length']
         batch_size = max_tokens // max_model_length
-        seqs = [Sequence(token_ids=[0]*max_model_length) for _ in range(batch_size)]
+        seqs = [Sequence(token_ids=[0]*max_model_length, block_size=self.config['block_size']) for _ in range(batch_size)]
         self.run(seqs, is_prefill=True)
         torch.cuda.empty_cache()
 
@@ -183,13 +211,40 @@ class ModelRunner:
         # check whether the current free memory can hold at least one block
         # compute the actual byte required of each block
         block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * self.default_dtype.itemsize
-        self.num_available_kv_blocks = int(available_mem // block_bytes)
-        assert self.num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
+        num_available_kv_blocks = int(available_mem // block_bytes)
+        assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
+        
+        # Synchronize max_cached_blocks across all ranks.
+        # Each rank independently computed num_available_kv_blocks from its own
+        # free GPU memory. Ranks may differ slightly: rank-0 carries extra overhead
+        # (NCCL buffers, process-group state) so it often has less free memory than
+        # workers. Without sync, the scheduler (which runs only on rank-0) would use
+        # rank-0's local value and could allocate more blocks than some rank can hold,
+        # causing an OOM on that rank during KV cache writes.
+        if self.world_size > 1:
+            print(f"[Rank {self.rank}] Local max_cached_blocks: {num_available_kv_blocks}")
+            per_rank_max_blocks_tensor = torch.tensor(
+                num_available_kv_blocks,
+                dtype=torch.long,
+                device=f'cuda:{self.rank}'
+            )
+            # all_reduce with MIN: every rank learns the most conservative limit,
+            # i.e. the block count that even the most memory-constrained rank can serve.
+            # This single agreed-upon value is then stored in config so the Scheduler
+            # (initialized afterwards on rank-0) never allocates more blocks than any
+            # rank can physically hold.
+            dist.all_reduce(per_rank_max_blocks_tensor, op=dist.ReduceOp.MIN)
+            self.config['max_cached_blocks'] = per_rank_max_blocks_tensor.item()
+        else:
+            # Single GPU: no cross-rank sync needed; use the local value directly.
+            self.config['max_cached_blocks'] = num_available_kv_blocks
+        if self.rank == 0:
+            print(f"[Rank 0] Global max_cached_blocks (min): {self.config['max_cached_blocks']}")
 
         # allocate max possible kv cache for the model, instead for each sequence
         # this is the key for paged attention: one giant KV cache pool, divided into blocks
         # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
-        allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.num_available_kv_blocks, self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
+        allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.config['max_cached_blocks'], self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):

@@ -8,6 +8,8 @@
 
 **原始开发环境及测试基于A6000 GPU。**
 
+[配套视频链接](https://www.bilibili.com/video/BV1Vjz1B2EQu)
+
 ---
 
 ## Step 1: Layers
@@ -416,7 +418,24 @@ if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
 
 **目的：** 作为序列与模型执行之间的桥梁。负责数据准备、CUDA Graph 优化以及采样。
 
-### 4.1 核心函数概览
+### 4.1 权重加载
+
+可以在CPU或GPU中加载权重，不同设备中进行模型的权重加载可能会导致权重出现问题。具体可以查看 [Issues #36](https://github.com/Wenyueh/MinivLLM/issues/36)。
+
+```python
+# Load weights in GPU (model moved to GPU before loading weights)
+self.model = self.model.cuda(rank)
+
+# Load pretrained weights if model_name_or_path is provided
+if config.get('model_name_or_path'):
+    from myvllm.utils.loader import load_weights_from_checkpoint
+    load_weights_from_checkpoint(self.model, config['model_name_or_path'])
+
+# Load weights in CPU (move the model to GPU after loading weights)
+# self.model = self.model.cuda(rank)
+```
+
+### 4.2 核心函数概览
 
 ```python
 class ModelRunner:
@@ -441,7 +460,7 @@ def capture_cudagraph(self): pass # 捕获 CUDA graphs 用于优化
 
 ---
 
-### 4.2 共享内存通信
+### 4.3 共享内存通信
 
 **`read_shm()`：**（Worker 进程从 master 进程读取）
 
@@ -469,7 +488,7 @@ for event in self.events:  # Note: plural, list of events
 
 ---
 
-### 4.3 内存管理
+### 4.4 内存管理
 
 **`warmup_model()`:**
 
@@ -491,7 +510,7 @@ for event in self.events:  # Note: plural, list of events
 
 ---
 
-### 4.4 数据准备
+### 4.5 数据准备
 
 **`prepare_prefill(seqs)`：**
 
@@ -576,7 +595,7 @@ new_slot = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
 
 ---
 
-### 4.5 模型执行
+### 4.6 模型执行
 
 **`run_model()`:**
 
@@ -608,7 +627,7 @@ graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 
 ---
 
-### 4.6 CUDA Graph 优化
+### 4.7 CUDA Graph 优化
 
 **`capture_cudagraph()`:**
 
@@ -636,7 +655,7 @@ graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 
 ---
 
-### 4.7 辅助方法
+### 4.8 辅助方法
 
 **`loop()`:**
 - worker 进程的主循环
@@ -649,7 +668,7 @@ graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 
 ---
 
-### 4.8 关系：torch.compile vs CUDA Graph
+### 4.9 关系：torch.compile vs CUDA Graph
 
 **torch.compile：**
 - 将多个操作融合成一个 kernel
@@ -670,6 +689,7 @@ graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 - 捕获执行图
 
 **组合使用：** `torch.compile` 减少 kernel 数量，CUDA graph 消除启动开销。
+
 
 
 ---
@@ -741,7 +761,17 @@ graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 
 ---
 
-### 6.2 清理
+### 6.2 初始化顺序
+
+**为什么 Scheduler 要在 ModelRunner 之后初始化？**
+
+当 `world_size > 1` 时，`ModelRunner.__init__` 会调用 `dist.init_process_group('nccl', ...)`，这是一个**集合屏障（collective barrier）**——rank-0 会阻塞，直到所有 worker 进程也完成该调用后才继续执行。只有在所有 rank 都完成汇合后，`ModelRunner.__init__` 才会返回。Scheduler 在此之后创建，确保分布式环境完全就绪后引擎才进入可用状态。
+
+当 `world_size == 1` 时，不会启动任何 worker 进程，也不存在屏障，因此此时初始化顺序没有实际影响。
+
+---
+
+### 6.3 清理
 
 **为什么要 `exit()` 以及 `atexit.register(self.exit)`？**
 ```python
@@ -769,3 +799,28 @@ atexit.register(self.exit)
 6. **LLM Engine**（顶层编排）
 
 每一步都建立在前一步之上，逐步构建一个完整的推理系统，并加入诸如 PagedAttention、CUDA graphs 与 prefix caching 等高级优化。
+
+## 课程练习
+
+感兴趣的读者可以在本地尝试向 MinivLLM 添加 `meta-llama/Llama-3.2-1B-Instruct` 作为练习。
+
+`meta-llama/Llama-3.2-1B-Instruct`（以下简称 Llama3.2） 和 `Qwen/Qwen3-0.6B` 有着相似的结构，模型组件上仅有 Rotary Embedding 的实现略有不同，在保持字段名相同的前提下，现有的权重加载代码 `loader.py` 不需要修改就能直接用在 Llama3.2 上。
+
+参考资料：
+- Llama3.2 的实现可以参考 [mini-sglang 中的 Llama3.2](https://github.com/sgl-project/mini-sglang/blob/main/python/minisgl/models/llama.py)
+- Rotary Embedding 实现的不同可以在 [mini-sglang 中的 Rotary Embedding](https://github.com/sgl-project/mini-sglang/blob/dae78f6bb97d5c5aaadbc0772fc964d48a8ee726/python/minisgl/layers/rotary.py#L72-L86) 中找到。
+- 各种模型参数可以在 [Hugging Face 中的 Llama3.2](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/tree/main) 的 `config.json` 文件中找到。
+
+为了完成练习，可以先把仓库克隆到本地，然后删除仓库中的 Llama3.2 实现：`rm src/myvllm/models/llama.py`，再自己创建一个 `src/myvllm/models/llama.py` 文件，通过参考链接中的 Llama3.2，自己基于 MinivLLM 实现 Llama3.2。
+
+添加 Llama3.2 只涉及以下文件的修改：
+- `src/myvllm/models/llama.py`: 模型实现。需要你动手实现
+- `src/myvllm/layers/rotary_embedding.py`: 需要添加 Llama3.2 的不同实现。
+- `src/myvllm/engine/model_runner.py`: ModelRunner 需要能够调用实现的 Llama3.2。
+- `main_llama32.py`: 负责测试 Llama3.2 的实现效果。
+
+运行 `main_llama32.py`，效果如下：
+
+![llama32-effect](assets/llama32-effect.png)
+
+由于后三个文件 `rotary_embedding.py`、`model_runner.py`、`main_llama32.py` 中要修改的地方不多，MinivLLM 已经实现好了，你所要做的就只是删除 `src/myvllm/models/llama.py` 文件，然后反复对照 [mini-sglang 中的 Llama3.2](https://github.com/sgl-project/mini-sglang/blob/main/python/minisgl/models/llama.py) 和 `src/myvllm/models/qwen3.py`，在 `src/myvllm/models/llama.py` 中实现你自己的 Llama3.2。实现好后，运行 `uv run main_llama32.py` 进行测试。如果实现无误，你应该可以看到和上面相似的效果。如果实在不会，请及时参考仓库中的原始 `src/myvllm/models/llama.py`。

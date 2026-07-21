@@ -8,6 +8,8 @@ This document provides a step-by-step guide to understanding and replicating vLL
 
 This package is developed using one A6000 GPU.
 
+[Video link](https://www.bilibili.com/video/BV1Vjz1B2EQu)
+
 ---
 
 ## Step 1: Layers
@@ -408,7 +410,24 @@ Path: [model_runner.py](src/myvllm/engine/model_runner.py)
 
 **Purpose:** Bridge between sequences and model execution. Handles data preparation, CUDA graph optimization, and sampling.
 
-### 4.1 Core Methods Overview
+### 4.1 Load Weights
+
+Weights can be loaded on the CPU or GPU, but loading weights on different devices may cause weight issues. You can refer to [Issues #36](https://github.com/Wenyueh/MinivLLM/issues/36) for details.
+
+```python
+# Load weights in GPU (model moved to GPU before loading weights)
+self.model = self.model.cuda(rank)
+
+# Load pretrained weights if model_name_or_path is provided
+if config.get('model_name_or_path'):
+    from myvllm.utils.loader import load_weights_from_checkpoint
+    load_weights_from_checkpoint(self.model, config['model_name_or_path'])
+
+# Load weights in CPU (move the model to GPU after loading weights)
+# self.model = self.model.cuda(rank)
+```
+
+### 4.2 Core Methods Overview
 
 ```python
 class ModelRunner:
@@ -432,7 +451,7 @@ class ModelRunner:
 
 ---
 
-### 4.2 Shared Memory Communication
+### 4.3 Shared Memory Communication
 
 **`read_shm()`:** (Worker process reads from master)
 
@@ -459,7 +478,7 @@ for event in self.events:  # Note: plural, list of events
 
 ---
 
-### 4.3 Memory Management
+### 4.4 Memory Management
 
 **`warmup_model()`:**
 
@@ -481,7 +500,7 @@ for event in self.events:  # Note: plural, list of events
 
 ---
 
-### 4.4 Data Preparation
+### 4.5 Data Preparation
 
 **`prepare_prefill(seqs)`:**
 
@@ -565,7 +584,7 @@ new_slot = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
 
 ---
 
-### 4.5 Model Execution
+### 4.6 Model Execution
 
 **`run_model()`:**
 
@@ -598,7 +617,7 @@ graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 
 ---
 
-### 4.6 CUDA Graph Optimization
+### 4.7 CUDA Graph Optimization
 
 **`capture_cudagraph()`:**
 
@@ -626,7 +645,7 @@ graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 
 ---
 
-### 4.7 Auxiliary Methods
+### 4.8 Auxiliary Methods
 
 **`loop()`:**
 - Worker process main loop
@@ -639,7 +658,7 @@ graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
 
 ---
 
-### 4.8 Relationship: torch.compile vs CUDA Graph
+### 4.9 Relationship: torch.compile vs CUDA Graph
 
 **torch.compile:**
 - Fuses multiple operations into one kernel
@@ -729,7 +748,17 @@ Path: [llm_engine.py](src/myvllm/engine/llm_engine.py)
 
 ---
 
-### 6.2 Cleanup
+### 6.2 Initialization Order
+
+**Why does the Scheduler init after the ModelRunner?**
+
+When `world_size > 1`, `ModelRunner.__init__` calls `dist.init_process_group('nccl', ...)`, which is a **collective barrier** — rank-0 blocks until every worker process has also called it. Only once all ranks have joined the process group does `ModelRunner.__init__` return. The Scheduler is created after that, ensuring the distributed environment is fully established before the engine is considered ready.
+
+When `world_size == 1` no worker processes are spawned and there is no barrier, so the ordering has no practical effect in that case.
+
+---
+
+### 6.3 Cleanup
 
 **Why `exit()` and `atexit.register(self.exit)`?**
 ```python
@@ -757,3 +786,28 @@ atexit.register(self.exit)
 6. **LLM Engine** (top-level orchestration)
 
 Each step builds on the previous, gradually constructing a complete inference system with advanced optimizations like PagedAttention, CUDA graphs, and prefix caching.
+
+## Course Exercise
+
+Interested readers can try adding `meta-llama/Llama-3.2-1B-Instruct` to MinivLLM locally as an exercise.
+
+`meta-llama/Llama-3.2-1B-Instruct` (hereinafter referred to as Llama3.2) has a similar structure to `Qwen/Qwen3-0.6B`. The only slight difference in model components lies in the implementation of Rotary Embedding. Provided that the field names remain the same, the existing weight loading code in `loader.py` can be used directly for Llama3.2 without any modifications.
+
+Reference materials:
+- For the implementation of Llama3.2, you can refer to [Llama3.2 in mini-sglang](https://github.com/sgl-project/mini-sglang/blob/main/python/minisgl/models/llama.py)
+- The differences in Rotary Embedding implementation can be found in [Rotary Embedding in mini-sglang](https://github.com/sgl-project/mini-sglang/blob/dae78f6bb97d5c5aaadbc0772fc964d48a8ee726/python/minisgl/layers/rotary.py#L72-L86).
+- Various model parameters can be found in the `config.json` file of [Llama3.2 on Hugging Face](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/tree/main).
+
+To complete the exercise, you can first clone the repository locally, then delete the Llama3.2 implementation in the repository: `rm src/myvllm/models/llama.py`. After that, create your own `src/myvllm/models/llama.py` file. By referring to the Llama3.2 implementation in the provided link, implement Llama3.2 yourself based on MinivLLM.
+
+Adding Llama3.2 only involves modifications to the following files:
+- `src/myvllm/models/llama.py`: Model implementation. This requires you to implement it yourself.
+- `src/myvllm/layers/rotary_embedding.py`: You need to add the different implementation for Llama3.2.
+- `src/myvllm/engine/model_runner.py`: The ModelRunner needs to be able to call the implemented Llama3.2.
+- `main_llama32.py`: Responsible for testing the implementation effect of Llama3.2.
+
+Run `main_llama32.py`, and the effect should look like this:
+
+![llama32-effect](assets/llama32-effect.png)
+
+Since the last three files (`rotary_embedding.py`, `model_runner.py`, `main_llama32.py`) require only minor modifications, MinivLLM has already implemented them. All you need to do is delete the `src/myvllm/models/llama.py` file, then repeatedly compare [Llama3.2 in mini-sglang](https://github.com/sgl-project/mini-sglang/blob/main/python/minisgl/models/llama.py) with `src/myvllm/models/qwen3.py`, and implement your own Llama3.2 in `src/myvllm/models/llama.py`. Once implemented, run `uv run main_llama32.py` to test. If your implementation is correct, you should see an effect similar to the one above. If you are truly stuck, refer to the original `src/myvllm/models/llama.py` in the repository in a timely manner.
